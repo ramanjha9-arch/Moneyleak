@@ -83,7 +83,7 @@ async function safeDeleteFile(filePath) {
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
 // Health check
-app.get("/api/health", (_, res) => res.json({ status: "ok", model: "gemini-2.0-flash" }));
+app.get("/api/health", (_, res) => res.json({ status: "ok", model: "gemini-2.5-flash" }));
 
 // Main analysis endpoint
 app.post("/api/analyze", upload.array("files", 5), async (req, res) => {
@@ -91,7 +91,7 @@ app.post("/api/analyze", upload.array("files", 5), async (req, res) => {
 
   try {
     const { textInput, analysisType = "full" } = req.body;
-    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
     const promptMap = {
       full: buildFullAnalysisPrompt(),
