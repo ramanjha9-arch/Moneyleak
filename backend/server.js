@@ -16,6 +16,10 @@ const PORT = process.env.PORT || 3001;
 // ─── Gemini Client ───────────────────────────────────────────────────────────
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
+// Primary model: gemini-1.5-flash, fallback: gemini-1.5-pro
+const PRIMARY_MODEL   = "gemini-1.5-flash";
+const FALLBACK_MODEL  = "gemini-1.5-pro";
+
 // ─── Middleware ───────────────────────────────────────────────────────────────
 app.use(cors({ origin: process.env.FRONTEND_URL || "http://localhost:5173" }));
 app.use(express.json({ limit: "50mb" }));
@@ -28,12 +32,31 @@ const storage = multer.diskStorage({
   destination: uploadDir,
   filename: (_, file, cb) => cb(null, `${Date.now()}-${file.originalname}`),
 });
+
+const ALLOWED_MIMES = [
+  "application/pdf",
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "text/plain",
+  "text/csv",
+  // Excel
+  "application/vnd.ms-excel",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "application/vnd.ms-excel.sheet.macroEnabled.12",
+];
+
 const upload = multer({
   storage,
   limits: { fileSize: 20 * 1024 * 1024 },
   fileFilter: (_, file, cb) => {
-    const allowed = ["application/pdf", "image/jpeg", "image/png", "image/webp", "text/plain", "text/csv"];
-    cb(null, allowed.includes(file.mimetype));
+    const ext = path.extname(file.originalname).toLowerCase();
+    const allowedExts = [".pdf",".jpg",".jpeg",".png",".webp",".txt",".csv",".xls",".xlsx",".xlsm"];
+    if (ALLOWED_MIMES.includes(file.mimetype) || allowedExts.includes(ext)) {
+      cb(null, true);
+    } else {
+      cb(new Error(`Unsupported file type: ${file.mimetype}`));
+    }
   },
 });
 
@@ -51,16 +74,6 @@ Your objective is to:
 - detect hidden financial risks
 - generate emotionally impactful insights
 
-You must analyze every transaction with:
-1. Primary Category
-2. Subcategory
-3. Behavioral Intent
-4. Necessity Score (1-10)
-5. Emotional Trigger Score (1-10)
-6. Financial Risk Weight (1-10)
-7. Recurrence Confidence (%)
-8. Lifestyle Dependency Score (1-10)
-
 Tone: intelligent, calm, premium, conversational, insightful. Never shame users.
 
 ALWAYS respond with ONLY valid JSON (no markdown, no explanation outside JSON).`;
@@ -72,26 +85,66 @@ function fileToBase64(filePath) {
 
 function getMimeType(filePath) {
   const ext = path.extname(filePath).toLowerCase();
-  const map = { ".pdf": "application/pdf", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp" };
-  return map[ext] || "application/octet-stream";
+  const map = {
+    ".pdf": "application/pdf",
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".png": "image/png", ".webp": "image/webp",
+    // Excel files — send as plain text after note; Gemini can't parse binary xlsx,
+    // we'll attach a text note saying it's tabular data
+  };
+  return map[ext] || null;
+}
+
+function isExcelFile(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  return [".xls", ".xlsx", ".xlsm"].includes(ext);
 }
 
 async function safeDeleteFile(filePath) {
   try { await unlinkAsync(filePath); } catch (_) { /* already gone */ }
 }
 
+async function generateWithFallback(parts) {
+  // Try primary model first
+  try {
+    const model = genAI.getGenerativeModel({ model: PRIMARY_MODEL });
+    const result = await model.generateContent(parts);
+    return { result, modelUsed: PRIMARY_MODEL };
+  } catch (primaryErr) {
+    console.warn(`Primary model (${PRIMARY_MODEL}) failed: ${primaryErr.message}. Trying fallback…`);
+    try {
+      const model = genAI.getGenerativeModel({ model: FALLBACK_MODEL });
+      const result = await model.generateContent(parts);
+      return { result, modelUsed: FALLBACK_MODEL };
+    } catch (fallbackErr) {
+      throw new Error(`Both models failed. Primary: ${primaryErr.message} | Fallback: ${fallbackErr.message}`);
+    }
+  }
+}
+
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
 // Health check
-app.get("/api/health", (_, res) => res.json({ status: "ok", model: "gemini-3.5-flash" }));
+app.get("/api/health", (_, res) => res.json({ status: "ok", primaryModel: PRIMARY_MODEL, fallbackModel: FALLBACK_MODEL }));
 
-// Main analysis endpoint
+// Main analysis endpoint (SSE streaming logs)
 app.post("/api/analyze", upload.array("files", 5), async (req, res) => {
   const uploadedPaths = (req.files || []).map((f) => f.path);
 
+  // Use Server-Sent Events for real-time logs
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders();
+
+  const sendEvent = (type, payload) => {
+    res.write(`data: ${JSON.stringify({ type, ...payload })}\n\n`);
+  };
+
   try {
     const { textInput, analysisType = "full" } = req.body;
-    const model = genAI.getGenerativeModel({ model: "gemini-3.5-flash" });
+
+    sendEvent("log", { step: 1, message: "📂 Files received, preparing analysis…" });
 
     const promptMap = {
       full: buildFullAnalysisPrompt(),
@@ -106,32 +159,61 @@ app.post("/api/analyze", upload.array("files", 5), async (req, res) => {
     const parts = [{ text: SYSTEM_PROMPT + "\n\n" + userPrompt }];
 
     if (textInput) {
+      sendEvent("log", { step: 2, message: "📋 Processing pasted transaction data…" });
       parts.push({ text: `\n\nRAW TRANSACTION DATA:\n${textInput}` });
     }
 
+    let fileCount = 0;
     for (const filePath of uploadedPaths) {
-      const mime = getMimeType(filePath);
-      if (mime !== "application/octet-stream") {
-        parts.push({
-          inlineData: { mimeType: mime, data: fileToBase64(filePath) },
-        });
+      fileCount++;
+      const fname = path.basename(filePath);
+      sendEvent("log", { step: 2, message: `📄 Processing file ${fileCount}: ${fname}…` });
+
+      if (isExcelFile(filePath)) {
+        // For Excel, we attach a note since Gemini can't parse binary xlsx
+        parts.push({ text: `\n\n[Excel file attached: ${fname}. Please analyze any transaction data present in this spreadsheet.]` });
+        sendEvent("log", { step: 2, message: `📊 Excel file detected — extracting as tabular data hint…` });
+      } else {
+        const mime = getMimeType(filePath);
+        if (mime) {
+          parts.push({ inlineData: { mimeType: mime, data: fileToBase64(filePath) } });
+        }
       }
     }
 
-    const result = await model.generateContent(parts);
+    sendEvent("log", { step: 3, message: "🧠 Sending to Gemini AI for deep analysis…" });
+
+    const { result, modelUsed } = await generateWithFallback(parts);
+
+    sendEvent("log", { step: 4, message: `✅ Response received from ${modelUsed}. Parsing JSON…` });
+
     const rawText = result.response.text().trim();
 
     // Clean JSON from possible markdown fences
-    const cleaned = rawText.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```$/i, "").trim();
-    const parsed = JSON.parse(cleaned);
+    const cleaned = rawText
+      .replace(/^```json\s*/i, "")
+      .replace(/^```\s*/i, "")
+      .replace(/\s*```$/i, "")
+      .trim();
 
-    res.json({ success: true, data: parsed });
+    sendEvent("log", { step: 5, message: "🔍 Validating and structuring your report…" });
+
+    let parsed;
+    try {
+      parsed = JSON.parse(cleaned);
+    } catch (parseErr) {
+      throw new Error(`AI returned invalid JSON. Raw response preview: ${cleaned.slice(0, 200)}…`);
+    }
+
+    sendEvent("log", { step: 6, message: "🎉 Analysis complete! Loading your report…" });
+    sendEvent("done", { success: true, data: parsed, modelUsed });
+
   } catch (err) {
     console.error("Analysis error:", err.message);
-    res.status(500).json({ success: false, error: err.message });
+    sendEvent("error", { success: false, error: err.message });
   } finally {
-    // Always wipe temp files
     for (const p of uploadedPaths) await safeDeleteFile(p);
+    res.end();
   }
 });
 
@@ -140,8 +222,6 @@ app.post("/api/chat", async (req, res) => {
   try {
     const { message, context } = req.body;
     if (!message) return res.status(400).json({ error: "message required" });
-
-    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
 
     const prompt = `${SYSTEM_PROMPT}
 
@@ -152,7 +232,7 @@ User question: "${message}"
 
 Respond with JSON: { "reply": "your insightful response", "tips": ["tip1", "tip2"], "alert": null or "alert message if urgent" }`;
 
-    const result = await model.generateContent(prompt);
+    const { result } = await generateWithFallback([{ text: prompt }]);
     const rawText = result.response.text().trim();
     const cleaned = rawText.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```$/i, "").trim();
     res.json({ success: true, data: JSON.parse(cleaned) });
@@ -323,4 +403,4 @@ function buildLeakPrompt() {
 }
 
 // ─── Start ────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => console.log(`MoneyLeak API running on port ${PORT}`));
+app.listen(PORT, () => console.log(`MoneyLeak API running on port ${PORT} | Primary: ${PRIMARY_MODEL} | Fallback: ${FALLBACK_MODEL}`));
