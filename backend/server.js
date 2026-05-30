@@ -17,8 +17,8 @@ const PORT = process.env.PORT || 3001;
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 // Primary model: gemini-1.5-flash, fallback: gemini-1.5-pro
-const PRIMARY_MODEL   = "gemini-1.5-flash";
-const FALLBACK_MODEL  = "gemini-1.5-pro";
+const PRIMARY_MODEL   = "gemini-3.5-flash";
+const FALLBACK_MODEL  = "gemini-2.5-flash-preview";
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
 app.use(cors({ origin: process.env.FRONTEND_URL || "http://localhost:5173" }));
